@@ -135,10 +135,28 @@ jobs:
 
           # ---------- tag 归档 ----------
           tg=0; hist=0; skip=0
+          # 上游真实 tag 名单：优先用 API（权威），失败时退回本地 refs 并排除遗留假名
+          if [ -n "${GH_TOKEN_FOR_API:-}" ]; then
+            curl -sS -H "Authorization: Bearer $GH_TOKEN_FOR_API" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/kingcharleslzy-ai/dsh-purge/tags?per_page=100&page=1" \
+              | grep -o '"name": *"[^"]*"' | sed 's/.*"name": *"//; s/"$//' > /tmp/up-tags.txt || true
+            for p in 2 3; do
+              curl -sS -H "Authorization: Bearer $GH_TOKEN_FOR_API" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/kingcharleslzy-ai/dsh-purge/tags?per_page=100&page=$p" \
+                | grep -o '"name": *"[^"]*"' | sed 's/.*"name": *"//; s/"$//' >> /tmp/up-tags.txt || true
+            done
+            sort -u /tmp/up-tags.txt -o /tmp/up-tags.txt
+          fi
+          if [ ! -s /tmp/up-tags.txt ]; then
+            echo "::warning::API 不可用，退回本地 refs 并排除遗留假名"
+            git for-each-ref --format='%(refname:lstrip=2)' 'refs/tags/*' \
+              | grep -vE '^archive-(tag|hist)__' | grep -vE '^archive_' > /tmp/up-tags.txt
+          fi
+          echo "上游 tag 名单: $(wc -l < /tmp/up-tags.txt) 个"
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
             case "$tag" in archive-tag__*|archive-hist__*) continue;; esac
-            case "$tag" in archive_*) echo "跳过遗留假名: $tag"; continue;; esac
+            case "$tag" in archive_*) continue;; esac
             sha=$(git rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null) || sha=''
             if [ -z "$sha" ]; then
               echo "跳过无法解析的 tag: $tag"
@@ -163,7 +181,7 @@ jobs:
             # 3. 刷新主指针
             git tag -f "archive-tag__${safe}" "$sha" >/dev/null
             tg=$((tg+1))
-          done < <(git for-each-ref --format='%(refname:lstrip=2)' refs/tags)
+          done < /tmp/up-tags.txt
 
           echo "分支归档=$br 跳过=$bskip | tag 归档=$tg 新历史留档=$hist 跳过=$skip"
           echo "本地归档分支=$(git for-each-ref 'refs/heads/archive-branches__*' --format='x' | wc -l)"

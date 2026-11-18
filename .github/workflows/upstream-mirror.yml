@@ -1,0 +1,353 @@
+name: upstream-mirror
+
+# 目的：把上游 kingcharleslzy-ai/dsh-purge 的每一次变更都同步进本 fork，
+# 并且把上游删掉的东西**永久留在归档 ref 里**，防止上游删库、force-push、
+# 删除 tag 或删减文件后我们不知道。
+#
+# 命名约定（关键，全部统一）：
+#   上游名里的每个 "/" 一律转成 "__"（safe 化），归档 ref 名不再出现 "/"。
+#   例：上游 tag "archive/v1.1.1" -> refs/tags/archive-tag__archive__v1.1.1
+#       上游分支 "feat/x"        -> refs/heads/archive-branches__feat__x
+#
+# 三层保护：
+#   1. refs/heads/archive-branches__*      —— 上游每个分支的快照（只增不删）
+#   2. refs/tags/archive-tag__*            —— 上游每个 tag 的当前指向
+#      refs/tags/archive-hist__*__<SHA12>  —— 上游每个 tag 的每个历史 SHA（永久留档）
+#   3. .archive/sync-log.md                —— 每轮同步记录，含上游删除行为检测
+#
+# GitHub 只持久化 refs/heads/* 与 refs/tags/*，自定义命名空间不落盘，
+# 所以归档层嵌在这两个命名空间里。
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      clean_legacy:
+        description: '清理历史遗留的非法归档 ref（含 "/" 的旧命名）'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-mirror
+  cancel-in-progress: false
+
+env:
+  # 上游名 -> 归档名：把 "/" 转成 "__"
+  UPSTREAM_REPO: https://github.com/kingcharleslzy-ai/dsh-purge.git
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.MIRROR_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  'upstream-mirror-bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_REPO" || true
+          if [ -n "${{ secrets.MIRROR_PAT }}" ]; then
+            git remote set-url origin "https://x-access-token:${{ secrets.MIRROR_PAT }}@github.com/${GITHUB_REPOSITORY}.git"
+            echo "推送凭据: MIRROR_PAT"
+          else
+            echo "::warning::未配置 MIRROR_PAT，指向含 .github/workflows 提交的 ref 可能被 GitHub 拒绝"
+            echo "推送凭据: GITHUB_TOKEN"
+          fi
+
+      - name: Fetch upstream (all refs + tags)
+        id: fetch
+        run: |
+          set -uo pipefail
+          ok=0
+          for attempt in 1 2 3; do
+            if git fetch upstream --prune --tags --force '+refs/heads/*:refs/remotes/upstream/*'; then
+              ok=1; break
+            fi
+            echo "第 $attempt 次拉取失败，5 秒后重试"
+            sleep 5
+          done
+          echo "fetch=$ok" >> "$GITHUB_OUTPUT"
+          if [ "$ok" != "1" ]; then
+            echo "::error::上游三次拉取均失败"
+            exit 1
+          fi
+          echo "上游分支数: $(git for-each-ref 'refs/remotes/upstream/*' --format='x' | wc -l)"
+          echo "上游 tag 数: $(git for-each-ref 'refs/tags/*' --exclude='refs/tags/archive-*' --format='x' | wc -l)"
+
+      - name: Clean legacy archive refs
+        if: ${{ github.event.inputs.clean_legacy != 'false' }}
+        run: |
+          set -uo pipefail
+          # 旧版把 "archive/v1.1.1" 直接拼成 "archive-tag__archive/v1.1.1"，
+          # 语义错位。这里删掉所有带 "/" 的归档 ref。
+          removed=0
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            git update-ref -d "$ref" 2>/dev/null && removed=$((removed+1)) || true
+          done < <(git for-each-ref --format='%(refname)' 'refs/tags/archive-tag__*' | grep '/' | grep -v '^refs/tags/archive-tag__[^/]*$')
+
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            git update-ref -d "$ref" 2>/dev/null && removed=$((removed+1)) || true
+          done < <(git for-each-ref --format='%(refname)' 'refs/tags/archive-hist__*' | awk -F/ 'NF>3')
+
+          echo "清理非法归档 ref: $removed 个"
+
+      - name: Build archive refs
+        run: |
+          set -euo pipefail
+
+          # ---------- 分支归档 ----------
+          br=0; bskip=0
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            [ "$ref" = "HEAD" ] && continue
+            sha=$(git rev-parse --verify "refs/remotes/upstream/$ref" 2>/dev/null) || { bskip=$((bskip+1)); continue; }
+            safe=$(printf '%s' "$ref" | sed 's#/#__#g')
+            git update-ref "refs/heads/archive-branches__${safe}" "$sha"
+            br=$((br+1))
+          done < <(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/upstream)
+
+          # ---------- tag 归档 ----------
+          tg=0; hist=0; skip=0
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            case "$tag" in archive-tag__*|archive-hist__*) continue;; esac
+            sha=$(git rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null) || sha=''
+            if [ -z "$sha" ]; then
+              echo "跳过无法解析的 tag: $tag"
+              skip=$((skip+1)); continue
+            fi
+            # safe 化：每个 "/" 转成 "__"，与分支规则完全一致
+            safe=$(printf '%s' "$tag" | sed 's#/#__#g')
+            dig=$(printf '%s' "$sha" | cut -c1-12)
+
+            # 1. 旧主指针若指向别的 commit，先把旧 SHA 留档
+            prev=$(git rev-parse --verify "refs/tags/archive-tag__${safe}^{commit}" 2>/dev/null) || prev=''
+            if [ -n "$prev" ] && [ "$prev" != "$sha" ]; then
+              pdig=$(printf '%s' "$prev" | cut -c1-12)
+              git tag -f "archive-hist__${safe}__${pdig}" "$prev" >/dev/null
+              echo "留档旧版本: $tag @ $pdig"
+              hist=$((hist+1))
+            fi
+
+            # 2. 本轮 SHA 无条件留档
+            git tag -f "archive-hist__${safe}__${dig}" "$sha" >/dev/null
+
+            # 3. 刷新主指针
+            git tag -f "archive-tag__${safe}" "$sha" >/dev/null
+            tg=$((tg+1))
+          done < <(git for-each-ref --format='%(refname:lstrip=2)' refs/tags)
+
+          echo "分支归档=$br 跳过=$bskip | tag 归档=$tg 新历史留档=$hist 跳过=$skip"
+          echo "本地归档分支=$(git for-each-ref 'refs/heads/archive-branches__*' --format='x' | wc -l)"
+          echo "本地归档 tag=$(git for-each-ref 'refs/tags/archive-tag__*' --format='x' | wc -l)"
+          echo "本地历史留档=$(git for-each-ref 'refs/tags/archive-hist__*' --format='x' | wc -l)"
+
+      - name: Detect upstream deletions
+        run: |
+          set -uo pipefail
+          : > /tmp/deleted.txt
+
+          # 分支：归档名 "__" 还原成 "/" 再去上游比对
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            name=${ref#archive-branches__}
+            orig=${name//__//}
+            if ! git rev-parse --verify "refs/remotes/upstream/$orig" >/dev/null 2>&1; then
+              echo "分支消失: $orig" | tee -a /tmp/deleted.txt
+            fi
+          done < <(git for-each-ref 'refs/heads/archive-branches__*' --format='%(refname:lstrip=2)')
+
+          # tag：archive-hist 名形如 archive-hist__<safe>__<sha12>，先剥 sha 再还原
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            name=${ref#archive-hist__}
+            base=${name%__*}
+            orig=${base//__//}
+            if ! git rev-parse --verify "refs/tags/$orig" >/dev/null 2>&1; then
+              echo "tag 消失: $orig" | tee -a /tmp/deleted.txt
+            fi
+          done < <(git for-each-ref 'refs/tags/archive-hist__*' --format='%(refname:lstrip=2)')
+
+          if [ -s /tmp/deleted.txt ]; then
+            echo "::warning::检测到上游删除行为"
+          else
+            echo "上游无删除行为"
+          fi
+
+      - name: Sync fork branches
+        run: |
+          set -uo pipefail
+          # 关键：master 承载本 workflow 与 sync-log 的提交，永不强制对齐上游。
+          # 其余分支照常快进；上游 master 的每个提交都已在 archive-branches__master 里。
+          updated=0; diverged=0; protected=0
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            [ "$ref" = "HEAD" ] && continue
+            if [ "$ref" = "master" ]; then
+              echo "跳过 master（承载本 workflow 与日志，不对齐上游；上游版本见 archive-branches__master）"
+              protected=$((protected+1))
+              continue
+            fi
+            up=$(git rev-parse --verify "refs/remotes/upstream/$ref" 2>/dev/null) || continue
+            if git rev-parse --verify "refs/heads/$ref" >/dev/null 2>&1; then
+              loc=$(git rev-parse "refs/heads/$ref")
+              [ "$loc" = "$up" ] && continue
+              if git merge-base --is-ancestor "$loc" "$up"; then
+                git update-ref "refs/heads/$ref" "$up"
+                echo "快进: $ref"
+                updated=$((updated+1))
+              else
+                echo "::notice::$ref 已分叉，保留本地，上游版已归档"
+                diverged=$((diverged+1))
+              fi
+            else
+              git update-ref "refs/heads/$ref" "$up"
+              echo "新建: $ref"
+              updated=$((updated+1))
+            fi
+          done < <(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/upstream)
+          echo "分支更新=$updated 分叉=$diverged 保护=$protected"
+
+      - name: Record sync log
+        run: |
+          set -euo pipefail
+          mkdir -p .archive
+          UP_MASTER=$(git rev-parse --short refs/remotes/upstream/master 2>/dev/null || echo unknown)
+          {
+            echo "## $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "- 上游 master: $UP_MASTER"
+            echo "- 上游 tag 数: $(git for-each-ref 'refs/tags/*' --exclude='refs/tags/archive-*' --format='x' | wc -l)"
+            echo "- 归档分支: $(git for-each-ref 'refs/heads/archive-branches__*' --format='x' | wc -l)"
+            echo "- 归档 tag: $(git for-each-ref 'refs/tags/archive-tag__*' --format='x' | wc -l)"
+            echo "- 历史留档: $(git for-each-ref 'refs/tags/archive-hist__*' --format='x' | wc -l)"
+            if [ -s /tmp/deleted.txt ]; then
+              echo "- **检测到上游删除**:"
+              sed 's/^/  - /' /tmp/deleted.txt
+            else
+              echo "- 上游删除: 无"
+            fi
+            echo ""
+          } >> .archive/sync-log.md
+          tail -c 300000 .archive/sync-log.md > /tmp/log
+          mv /tmp/log .archive/sync-log.md
+
+      - name: Commit sync log
+        run: |
+          set -euo pipefail
+          git add .archive/sync-log.md
+          if git diff --cached --quiet; then
+            echo '同步日志无变化'
+          else
+            git commit -m "chore(archive): 同步日志 $(date -u +%Y-%m-%dT%H:%MZ)"
+          fi
+
+      - name: Push branches
+        run: |
+          set -euo pipefail
+          # 只推归档分支，绝不 force 整个 refs/heads/*（那会把 master 上的
+          # 本 workflow 提交一起覆盖掉，导致定时任务自我删除）。
+          git push origin --force 'refs/heads/archive-branches__*:refs/heads/archive-branches__*'
+          # 其余非 master 分支按需快进推送（非强制）
+          git for-each-ref --format='%(refname:lstrip=3)' refs/heads \
+            | grep -v '^archive-branches__' | grep -v '^master$' \
+            | sed 's#^#refs/heads/&:refs/heads/#' > /tmp/br-specs.txt || true
+          if [ -s /tmp/br-specs.txt ]; then
+            mapfile -t brs < /tmp/br-specs.txt
+            git push origin "${brs[@]}" || echo "::warning::部分分支推送被拒（分叉或权限），已跳过"
+          fi
+          # 日志提交（若有）只推到 master
+          if git log --oneline origin/master..HEAD | grep -q .; then
+            git push origin HEAD:master || echo "::warning::master 日志提交推送被拒"
+          fi
+
+      - name: Push tags
+        run: |
+          set -euo pipefail
+          git for-each-ref 'refs/tags/archive-tag__*' 'refs/tags/archive-hist__*' --format='%(refname)' > /tmp/at.txt
+          echo "待推送归档 tag: $(wc -l < /tmp/at.txt)"
+          : > /tmp/push-failed.txt
+          batch=0
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            echo "$ref:${ref}"
+          done < /tmp/at.txt > /tmp/specs.txt
+          split -l 40 /tmp/specs.txt /tmp/rs_
+          for f in /tmp/rs_*; do
+            batch=$((batch+1))
+            mapfile -t specs < "$f"
+            if ! git push origin --force "${specs[@]}"; then
+              echo "::warning::第 $batch 批部分被拒"
+              cat "$f" >> /tmp/push-failed.txt
+            fi
+          done
+          if [ -s /tmp/push-failed.txt ]; then
+            echo "::warning::以下 ref 未推送成功："
+            cat /tmp/push-failed.txt
+          fi
+
+      - name: Verify archive completeness
+        run: |
+          set -euo pipefail
+          git fetch origin '+refs/tags/archive-*:refs/tags/archive-*' --force 2>/dev/null || true
+
+          up_tags=$(git for-each-ref 'refs/tags/*' --exclude='refs/tags/archive-*' --format='%(refname:lstrip=2)')
+          missing=0
+          for t in $up_tags; do
+            safe=$(printf '%s' "$t" | sed 's#/#__#g')
+            if ! git rev-parse --verify "refs/tags/archive-tag__${safe}" >/dev/null 2>&1; then
+              echo "::error::缺失归档 tag: $t"
+              missing=$((missing+1))
+            fi
+          done
+
+          up_branches=$(git for-each-ref 'refs/remotes/upstream/*' --format='%(refname:lstrip=3)')
+          for b in $up_branches; do
+            [ "$b" = "HEAD" ] && continue
+            safe=$(printf '%s' "$b" | sed 's#/#__#g')
+            if ! git rev-parse --verify "refs/heads/archive-branches__${safe}" >/dev/null 2>&1; then
+              echo "::error::缺失归档分支: $b"
+              missing=$((missing+1))
+            fi
+          done
+
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::共 $missing 项缺失"
+            exit 1
+          fi
+          echo "归档完整性校验通过：tag $(echo "$up_tags" | wc -l) 个、分支 $(echo "$up_branches" | wc -l) 个"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## 上游同步结果'
+            echo ""
+            echo "| 层 | 数量 |"
+            echo "|---|---|"
+            echo "| 上游 tag | $(git for-each-ref 'refs/tags/*' --exclude='refs/tags/archive-*' --format='x' 2>/dev/null | wc -l) |"
+            echo "| 上游分支 | $(git for-each-ref 'refs/remotes/upstream/*' --format='x' 2>/dev/null | wc -l) |"
+            echo "| 归档 tag | $(git for-each-ref 'refs/tags/archive-tag__*' --format='x' 2>/dev/null | wc -l) |"
+            echo "| 历史留档 | $(git for-each-ref 'refs/tags/archive-hist__*' --format='x' 2>/dev/null | wc -l) |"
+            echo "| 归档分支 | $(git for-each-ref 'refs/heads/archive-branches__*' --format='x' 2>/dev/null | wc -l) |"
+            echo ""
+            if [ -s /tmp/deleted.txt ]; then
+              echo '### 检测到上游删除'
+              cat /tmp/deleted.txt
+            else
+              echo '### 上游删除: 无'
+            fi
+          } >> $GITHUB_STEP_SUMMARY

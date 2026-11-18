@@ -104,6 +104,20 @@ jobs:
 
           echo "清理非法归档 ref: $removed 个"
 
+      - name: Purge legacy archive refs
+        run: |
+          set -uo pipefail
+          n=0
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            body=${ref#refs/tags/}
+            body=${body#archive-tag__}; body=${body#archive-hist__}
+            case "$body" in
+              archive_*) git update-ref -d "$ref" 2>/dev/null && n=$((n+1)) || true ;;
+            esac
+          done < <(git for-each-ref --format='%(refname)' 'refs/tags/archive-tag__*' 'refs/tags/archive-hist__*')
+          echo "清除遗留假归档 ref: $n"
+
       - name: Build archive refs
         run: |
           set -euo pipefail
@@ -124,6 +138,7 @@ jobs:
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
             case "$tag" in archive-tag__*|archive-hist__*) continue;; esac
+            case "$tag" in archive_*) echo "跳过遗留假名: $tag"; continue;; esac
             sha=$(git rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null) || sha=''
             if [ -z "$sha" ]; then
               echo "跳过无法解析的 tag: $tag"
@@ -176,6 +191,7 @@ jobs:
             name=${ref#archive-hist__}
             base=${name%__*}
             orig=${base//__//}
+            case "$orig" in archive_*) continue;; esac
             if ! git rev-parse --verify "refs/tags/$orig" >/dev/null 2>&1; then
               echo "tag 消失: $orig" | tee -a /tmp/deleted.txt
             fi

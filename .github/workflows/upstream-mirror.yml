@@ -37,7 +37,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # 上游名 -> 归档名：把 "/" 转成 "__"
+  GH_TOKEN_FOR_API: ${{ secrets.MIRROR_PAT || secrets.GITHUB_TOKEN }}
   UPSTREAM_REPO: https://github.com/kingcharleslzy-ai/dsh-purge.git
 
 jobs:
